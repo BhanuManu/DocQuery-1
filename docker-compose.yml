@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  db:
+    # This replaces the "-d pgvector/pgvector:pg16" part. It tells Docker what to download.
+    image: pgvector/pgvector:pg16
+    
+    # This replaces the "--name docquery-db" part.
+    container_name: docquery-db
+    
+    # This replaces the "-e" parts. It sets up your database credentials.
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: docquery
+      
+    # This replaces the "-p 5432:5432" part. It connects your PC to the container.
+    ports:
+      - "5432:5432"

@@ -1,0 +1,14 @@
+# Ignore the Python virtual environment
+myspace/
+__pycache__/
+
+# Ignore database volumes (if you mapped them locally)
+postgres_data/
+
+# Ignore secret keys
+.env
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
