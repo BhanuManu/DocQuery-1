@@ -10,7 +10,10 @@ from datetime import datetime, timedelta
 import models
 import schemas
 from database import engine, get_db
+from sentence_transformers import SentenceTransformer
 
+# Load the model into memory globally (this will take a few seconds on startup)
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 SECRET_KEY = "your-super-secret-key-change-this-later"
 ALGORITHM = "HS256"
@@ -27,6 +30,19 @@ def get_password_hash(password):
     return pwd_context.hash(password)
 
 app = FastAPI()
+
+def get_text_chunks(text: str, chunk_size: int = 500, overlap: int = 50):
+    chunks = []
+    start = 0
+    text_length = len(text)
+    
+    while start < text_length:
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        # Move forward by the chunk size MINUS the overlap
+        start += (chunk_size - overlap)
+        
+    return chunks
 
 def create_access_token(data: dict):
     to_encode = data.copy()
@@ -78,37 +94,80 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
-    # 1. Validate that the uploaded file is actually a PDF
+async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)):
     if file.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="File must be a PDF")
     
     try:
-        # 2. Read the file completely into the server's memory
+        # 1. Read and extract text
         contents = await file.read()
         pdf_file = io.BytesIO(contents)
-        
-        # 3. Parse the PDF using pypdf
         reader = PdfReader(pdf_file)
         extracted_text = ""
-        
-        # 4. Loop through every page and extract the text
-        for page_num in range(len(reader.pages)):
-            page = reader.pages[page_num]
+        for page in reader.pages:
             extracted_text += page.extract_text() + "\n"
             
-        # 5. Print the first 500 characters to the terminal to verify it worked
-        print("\n--- EXTRACTED TEXT PREVIEW ---")
-        print(extracted_text[:500])
-        print("------------------------------\n")
+        # 2. Slice the text into overlapping chunks
+        text_chunks = get_text_chunks(extracted_text)
+        
+        # 3. Create the parent Document record (Hardcoded user_id=1 for testing right now)
+        new_doc = models.Document(filename=file.filename, user_id=1)
+        db.add(new_doc)
+        db.commit()
+        db.refresh(new_doc)
+        
+        # 4. Generate vectors and save chunks to the database
+        for chunk_text in text_chunks:
+            # Clean up empty chunks
+            if not chunk_text.strip():
+                continue
+                
+            # Ask the AI model to convert the text to numbers
+            vector_array = embedding_model.encode(chunk_text).tolist()
+            
+            # Save to PostgreSQL
+            new_chunk = models.DocumentChunk(
+                document_id=new_doc.id,
+                text_content=chunk_text,
+                embedding=vector_array
+            )
+            db.add(new_chunk)
+            
+        db.commit()
         
         return {
             "filename": file.filename, 
-            "status": "Successfully parsed",
-            "total_pages": len(reader.pages)
+            "status": "Successfully chunked and vectorized",
+            "total_chunks_saved": len(text_chunks)
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error parsing PDF: {str(e)}")
-
-#tis is test from fedora
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+    
+@app.post("/query")
+def search_documents(request: schemas.QueryRequest, db: Session = Depends(get_db)):
+    
+    try:
+        # 1. Convert the user's question into a mathematical vector
+        question_vector = embedding_model.encode(request.question).tolist()
+        
+        # 2. Search the database for the 3 closest chunks using cosine_distance
+        # Smaller distance means the text is more mathematically similar to the question
+        results = db.query(models.DocumentChunk).order_by(
+            models.DocumentChunk.embedding.cosine_distance(question_vector)
+        ).limit(3).all()
+        
+        if not results:
+            raise HTTPException(status_code=404, detail="No relevant documents found.")
+            
+        # 3. Extract the raw text from the database objects
+        retrieved_text = [chunk.text_content for chunk in results]
+        
+        return {
+            "question": request.question,
+            "relevant_chunks": retrieved_text
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")

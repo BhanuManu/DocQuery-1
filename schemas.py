@@ -12,3 +12,6 @@ class UserResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+class QueryRequest(BaseModel):
+    question: str
