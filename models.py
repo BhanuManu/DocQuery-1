@@ -33,3 +33,11 @@ class DocumentChunk(Base):
     embedding = Column(Vector(384)) 
     
     document = relationship("Document", back_populates="chunks")
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String, index=True) # Groups messages belonging to the same chat
+    question = Column(Text)
+    answer = Column(Text)

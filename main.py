@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
 import io
 from fastapi.security import OAuth2PasswordRequestForm
@@ -11,6 +12,15 @@ import models
 import schemas
 from database import engine, get_db
 from sentence_transformers import SentenceTransformer
+
+from dotenv import load_dotenv
+load_dotenv()
+
+import os
+from google import genai
+
+# Initialize the Gemini client (it automatically reads the GEMINI_API_KEY from your terminal)
+gemini_client = genai.Client()
 
 # Load the model into memory globally (this will take a few seconds on startup)
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
@@ -30,6 +40,15 @@ def get_password_hash(password):
     return pwd_context.hash(password)
 
 app = FastAPI()
+
+# Add this CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all frontend domains (good for local testing)
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows GET, POST, OPTIONS, etc.
+    allow_headers=["*"],
+)
 
 def get_text_chunks(text: str, chunk_size: int = 500, overlap: int = 50):
     chunks = []
@@ -149,25 +168,70 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
 def search_documents(request: schemas.QueryRequest, db: Session = Depends(get_db)):
     
     try:
-        # 1. Convert the user's question into a mathematical vector
-        question_vector = embedding_model.encode(request.question).tolist()
+        # 1. Fetch previous conversation history (limit to last 3 to save AI tokens)
+        past_chats = db.query(models.ChatMessage).filter(
+            models.ChatMessage.session_id == request.session_id
+        ).order_by(models.ChatMessage.id.desc()).limit(3).all()
         
-        # 2. Search the database for the 3 closest chunks using cosine_distance
-        # Smaller distance means the text is more mathematically similar to the question
+        # Reverse the list so the oldest is first, chronological order
+        past_chats.reverse()
+        
+        # Format the history into a string script
+        history_string = ""
+        for chat in past_chats:
+            history_string += f"User: {chat.question}\nAssistant: {chat.answer}\n\n"
+
+        # 2. Convert the new question into a vector and search PDF chunks
+        question_vector = embedding_model.encode(request.question).tolist()
         results = db.query(models.DocumentChunk).order_by(
             models.DocumentChunk.embedding.cosine_distance(question_vector)
         ).limit(3).all()
         
-        if not results:
-            raise HTTPException(status_code=404, detail="No relevant documents found.")
-            
-        # 3. Extract the raw text from the database objects
-        retrieved_text = [chunk.text_content for chunk in results]
+        retrieved_text = [chunk.text_content for chunk in results] if results else ["No PDF context found."]
+        context_string = "\n\n---\n\n".join(retrieved_text)
+        
+        # 3. Construct the Memory-Aware Prompt
+        prompt = f"""You are a Retrieval-Augmented Generation (RAG) assistant. Your sole task is to answer user queries using only the provided text chunks.
+
+        Strict Constraints:
+
+        Source Grounding: Do not use any outside knowledge or internal training data.
+
+        Negative Constraint: If the provided text does not contain the answer, state exactly: "I don't know based on the document."
+
+        No Hallucinations: Do not attempt to fill in gaps or infer information not explicitly stated.
+        
+        [PREVIOUS CONVERSATION HISTORY]
+        {history_string}
+        
+        [DOCUMENT CHUNKS]
+        {context_string}
+        
+        [NEW QUESTION]
+        User: {request.question}"""
+        
+        # 4. Generate the answer with Gemini
+        response = gemini_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
+        
+        # 5. Save the new exchange to the database
+        new_message = models.ChatMessage(
+            session_id=request.session_id,
+            question=request.question,
+            answer=response.text
+        )
+        db.add(new_message)
+        db.commit()
         
         return {
+            "session_id": request.session_id,
             "question": request.question,
-            "relevant_chunks": retrieved_text
+            "answer": response.text,
+            "sources": retrieved_text
         }
         
     except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
