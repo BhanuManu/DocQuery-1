@@ -1,121 +1,152 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
-import heroImg from './assets/hero.png'
-import './App.css'
+import { useState, useEffect } from 'react';
+import axios from 'axios';
 
 function App() {
-  const [count, setCount] = useState(0)
+  // Auth State
+  const [token, setToken] = useState('');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [authMessage, setAuthMessage] = useState('');
 
+  // App State
+  const [sessionId, setSessionId] = useState('');
+  const [file, setFile] = useState(null);
+  const [uploadMessage, setUploadMessage] = useState('');
+  const [query, setQuery] = useState('');
+  const [chatHistory, setChatHistory] = useState([]);
+
+  useEffect(() => {
+    setSessionId("chat_" + Math.random().toString(36).substr(2, 9));
+  }, []);
+
+  // --- 1. The Login Logic ---
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    try {
+      // FastAPI's OAuth2PasswordRequestForm requires URL-encoded form data, NOT JSON.
+      const params = new URLSearchParams();
+      params.append('username', username);
+      params.append('password', password);
+
+      const response = await axios.post('http://127.0.0.1:8000/login', params);
+      setToken(response.data.access_token);
+      setAuthMessage("Logged in successfully!");
+    } catch (error) {
+      console.error(error);
+      setAuthMessage("Login failed. Check your credentials.");
+    }
+  };
+
+  // --- 2. The Upload Logic ---
+  const handleFileUpload = async (e) => {
+    e.preventDefault();
+    if (!file) {
+      setUploadMessage("Please select a file first.");
+      return;
+    }
+
+    setUploadMessage("Uploading and processing AI vectors...");
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      await axios.post('http://127.0.0.1:8000/upload', formData, {
+        headers: { 
+          'Content-Type': 'multipart/form-data',
+          'Authorization': `Bearer ${token}` // INJECTING THE VIP WRISTBAND
+        }
+      });
+      setUploadMessage("Upload successful! You can now ask questions.");
+    } catch (error) {
+      console.error(error);
+      setUploadMessage("Upload failed. Check the console.");
+    }
+  };
+
+  // --- 3. The Chat Logic ---
+  const handleSendMessage = async (e) => {
+    e.preventDefault();
+    if (!query.trim()) return;
+
+    const newChat = [...chatHistory, { sender: 'User', text: query }];
+    setChatHistory(newChat);
+    const userQuestion = query;
+    setQuery(''); 
+
+    try {
+      const response = await axios.post('http://127.0.0.1:8000/query', {
+        question: userQuestion,
+        session_id: sessionId
+      }, {
+        headers: {
+          'Authorization': `Bearer ${token}` // INJECTING THE VIP WRISTBAND
+        }
+      });
+      
+      setChatHistory([...newChat, { sender: 'Gemini', text: response.data.answer }]);
+    } catch (error) {
+      console.error(error);
+      setChatHistory([...newChat, { sender: 'System', text: 'Error: Could not connect to backend.' }]);
+    }
+  };
+
+  // --- UI RENDERING ---
+  
+  // If there is no token, show the Login Screen
+  if (!token) {
+    return (
+      <div style={{ padding: '20px', fontFamily: 'sans-serif', maxWidth: '400px', margin: '50px auto', border: '1px solid #ccc' }}>
+        <h2>Login to DocQuery</h2>
+        <form onSubmit={handleLogin} style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+          <input type="text" placeholder="Username" value={username} onChange={e => setUsername(e.target.value)} required />
+          <input type="password" placeholder="Password" value={password} onChange={e => setPassword(e.target.value)} required />
+          <button type="submit">Login</button>
+        </form>
+        <p>{authMessage}</p>
+      </div>
+    );
+  }
+
+  // If there is a token, show the Main App
   return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
-        </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.jsx</code> and save to test <code>HMR</code>
-          </p>
-        </div>
-        <button
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
-        >
-          Count is {count}
-        </button>
-      </section>
+    <div style={{ padding: '20px', fontFamily: 'sans-serif', maxWidth: '800px', margin: '0 auto' }}>
+      <h1>DocQuery AI</h1>
+      <p>Session ID: {sessionId}</p>
 
-      <div className="ticks"></div>
+      {/* The Upload Panel */}
+      <div style={{ border: '1px solid #ccc', padding: '15px', marginBottom: '20px' }}>
+        <h3>1. Upload PDF</h3>
+        <form onSubmit={handleFileUpload}>
+          <input type="file" accept="application/pdf" onChange={(e) => setFile(e.target.files[0])} />
+          <button type="submit">Upload to Database</button>
+        </form>
+        <p>{uploadMessage}</p>
+      </div>
 
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
+      {/* The Chat Interface */}
+      <div style={{ border: '1px solid #ccc', padding: '15px' }}>
+        <h3>2. Ask Questions</h3>
+        <div style={{ height: '300px', overflowY: 'auto', border: '1px solid #eee', padding: '10px', marginBottom: '10px' }}>
+          {chatHistory.map((msg, index) => (
+            <div key={index} style={{ marginBottom: '10px' }}>
+              <strong>{msg.sender}: </strong> {msg.text}
+            </div>
+          ))}
         </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
-        </div>
-      </section>
 
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
-  )
+        <form onSubmit={handleSendMessage} style={{ display: 'flex', gap: '10px' }}>
+          <input 
+            type="text" 
+            value={query} 
+            onChange={(e) => setQuery(e.target.value)} 
+            placeholder="What is this document about?" 
+            style={{ flexGrow: 1, padding: '5px' }}
+          />
+          <button type="submit">Send</button>
+        </form>
+      </div>
+    </div>
+  );
 }
 
-export default App
+export default App;
