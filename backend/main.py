@@ -116,7 +116,7 @@ def register_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
     hashed_password = get_password_hash(user.password)
     
     # Step C: Create the new user object and save it to PostgreSQL
-    new_user = models.User(username=user.username, hashed_password=hashed_password)
+    new_user = models.User(username=user.username, hashed_password=hashed_password, email=user.email)
     db.add(new_user)
     db.commit()          # Saves the transaction
     db.refresh(new_user) # Reloads the object to get the assigned ID
@@ -213,8 +213,11 @@ async def upload_document(file: UploadFile = File(...), current_user: User = Dep
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
     
 @app.post("/query")
-def search_documents(request: schemas.QueryRequest, db: Session = Depends(get_db)):
-    
+def search_documents(
+    request: schemas.QueryRequest, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user) # <-- FIX 1: Injected the user dependency
+):
     try:
         # 1. Fetch previous conversation history (limit to last 3 to save AI tokens)
         past_chats = db.query(models.ChatMessage).filter(
@@ -264,11 +267,22 @@ def search_documents(request: schemas.QueryRequest, db: Session = Depends(get_db
             contents=prompt
         )
         
-        # 5. Save the new exchange to the database
+        # 5. Check if the session exists, if not, create it!
+        session_record = db.query(models.ChatSession).filter(models.ChatSession.session_id == request.session_id).first()
+        
+        if not session_record:
+            new_session = models.ChatSession(
+                session_id=request.session_id, 
+                user_id=current_user.id 
+            )
+            db.add(new_session)
+            db.commit()
+
+        # 6. Now it is safe to save the message
         new_message = models.ChatMessage(
             session_id=request.session_id,
             question=request.question,
-            answer=response.text
+            answer=response.text # <-- FIX 2: Extracted the text string
         )
         db.add(new_message)
         db.commit()
@@ -290,22 +304,24 @@ def search_documents(request: schemas.QueryRequest, db: Session = Depends(get_db
 # ==========================================
 
 @app.get("/sessions")
-async def get_user_sessions(db: Session = Depends(get_db)):
-    """Fetches all unique session IDs and their very first question to use as a title."""
-    # Note: Assuming you have a ChatMessage table. Adjust the model name if yours is different!
+async def get_user_sessions(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    """Fetches all sessions and their metadata for the logged-in user."""
     try:
-        # Get the first question asked in every session to use as the "Title"
-        subquery = db.query(
-            ChatMessage.session_id,
-            func.min(ChatMessage.id).label('min_id')
-        ).group_by(ChatMessage.session_id).subquery()
-
-        sessions = db.query(ChatMessage).join(
-            subquery, 
-            (ChatMessage.session_id == subquery.c.session_id) & (ChatMessage.id == subquery.c.min_id)
-        ).all()
-
-        return [{"session_id": s.session_id, "first_question": s.question[:40] + "..."} for s in sessions]
+        sessions = db.query(models.ChatSession).filter(models.ChatSession.user_id == current_user.id).order_by(models.ChatSession.created_at.desc()).all()
+        
+        result = []
+        for s in sessions:
+            first_msg = db.query(models.ChatMessage).filter(models.ChatMessage.session_id == s.session_id).order_by(models.ChatMessage.id.asc()).first()
+            first_question = first_msg.question[:40] + "..." if first_msg else ""
+            
+            result.append({
+                "session_id": s.session_id, 
+                "title": s.title if s.title != "New Chat" else None, # Let frontend fallback to first_question if title is default
+                "is_pinned": s.is_pinned,
+                "first_question": first_question
+            })
+            
+        return result
     except Exception as e:
         return []
 
@@ -354,17 +370,18 @@ async def get_documents(db: Session = Depends(get_db)):
 async def delete_document(filename: str, db: Session = Depends(get_db)):
     """Deletes the PDF, its database record, and all vector chunks."""
     try:
-        # 1. Find the parent document in the database
-        doc = db.query(models.Document).filter(models.Document.filename == filename).first()
+        # 1. Find ALL parent documents with this filename in the database
+        docs = db.query(models.Document).filter(models.Document.filename == filename).all()
         
-        if not doc:
+        if not docs:
             raise HTTPException(status_code=404, detail="Document not found in database.")
 
-        # 2. Delete all associated chunks using the document_id
-        db.query(models.DocumentChunk).filter(models.DocumentChunk.document_id == doc.id).delete()
-        
-        # 3. Delete the parent document record itself
-        db.delete(doc)
+        for doc in docs:
+            # 2. Delete all associated chunks using the document_id
+            db.query(models.DocumentChunk).filter(models.DocumentChunk.document_id == doc.id).delete()
+            # 3. Delete the parent document record itself
+            db.delete(doc)
+            
         db.commit()
 
         # 4. Delete the physical file from your hard drive so it stops taking up space!
@@ -392,3 +409,89 @@ async def view_document(filename: str):
     else:
         # 3. If it STILL fails, this will print the exact path it tried to search!
         raise HTTPException(status_code=404, detail=f"Server could not find file at: {file_path}")
+    
+
+@app.delete("/history/{session_id}")
+def delete_chat_session(session_id: str, db: Session = Depends(get_db)):
+    # 1. ALWAYS delete ChatMessages first, to prevent "ghost chats" from reappearing.
+    # This handles cases where a chat exists but a ChatSession record is missing.
+    db.query(models.ChatMessage).filter(models.ChatMessage.session_id == session_id).delete()
+    
+    # 2. Try to find and delete the ChatSession parent record
+    session = db.query(models.ChatSession).filter(models.ChatSession.session_id == session_id).first()
+    if session:
+        db.delete(session) 
+        
+    db.commit()
+    return {"message": "Chat completely deleted"}
+
+@app.put("/history/{session_id}/rename")
+def rename_chat_session(session_id: str, request: schemas.ChatRenameRequest, db: Session = Depends(get_db)):
+    session = db.query(models.ChatSession).filter(models.ChatSession.session_id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    session.title = request.title
+    db.commit()
+    return {"message": "Chat renamed", "title": session.title}
+
+@app.put("/history/{session_id}/pin")
+def pin_chat_session(session_id: str, request: schemas.ChatPinRequest, db: Session = Depends(get_db)):
+    session = db.query(models.ChatSession).filter(models.ChatSession.session_id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    session.is_pinned = request.is_pinned
+    db.commit()
+    return {"message": "Pin status updated", "is_pinned": session.is_pinned}
+
+@app.get("/users/me", response_model=schemas.UserResponse)
+def get_user_me(current_user: models.User = Depends(get_current_user)):
+    return current_user
+
+@app.get("/users/me/stats", response_model=schemas.UserStats)
+def get_user_stats(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    docs_count = db.query(models.Document).filter(models.Document.user_id == current_user.id).count()
+    sessions_count = db.query(models.ChatSession).filter(models.ChatSession.user_id == current_user.id).count()
+    
+    total_qs = db.query(models.ChatMessage).join(models.ChatSession, models.ChatMessage.session_id == models.ChatSession.session_id).filter(models.ChatSession.user_id == current_user.id).count()
+    
+    return {
+        "storage_used": docs_count,
+        "conversations": sessions_count,
+        "total_questions": total_qs
+    }
+
+@app.put("/users/me/password")
+def change_password(request: schemas.PasswordChange, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    from passlib.context import CryptContext
+    pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+    
+    if not pwd_context.verify(request.current_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Incorrect current password")
+    
+    current_user.hashed_password = get_password_hash(request.new_password)
+    db.commit()
+    return {"message": "Password updated successfully"}
+
+@app.delete("/users/me")
+def delete_account(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # 1. Delete all chat messages belonging to this user's sessions
+    sessions = db.query(models.ChatSession).filter(models.ChatSession.user_id == current_user.id).all()
+    session_ids = [s.session_id for s in sessions]
+    if session_ids:
+        db.query(models.ChatMessage).filter(models.ChatMessage.session_id.in_(session_ids)).delete(synchronize_session=False)
+        db.query(models.ChatSession).filter(models.ChatSession.user_id == current_user.id).delete(synchronize_session=False)
+        
+    # 2. Delete all document chunks and documents
+    docs = db.query(models.Document).filter(models.Document.user_id == current_user.id).all()
+    doc_ids = [d.id for d in docs]
+    if doc_ids:
+        db.query(models.DocumentChunk).filter(models.DocumentChunk.document_id.in_(doc_ids)).delete(synchronize_session=False)
+        db.query(models.Document).filter(models.Document.user_id == current_user.id).delete(synchronize_session=False)
+        
+    # 3. Delete user
+    db.delete(current_user)
+    db.commit()
+    
+    return {"message": "Account deleted successfully"}

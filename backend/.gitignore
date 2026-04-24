@@ -7,7 +7,7 @@ postgres_data/
 
 # Ignore secret keys
 .env
-
+uploads/
 # Windows
 Thumbs.db
 ehthumbs.db
